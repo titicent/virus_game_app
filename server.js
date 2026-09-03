@@ -43,7 +43,7 @@ const codigo = () => {
 };
 
 function crearSala(nombre, ws) {
-  const s = { codigo: codigo(), jugadores: [], opciones: {expansion:true, duelo:false, aprendizaje:false},
+  const s = { codigo: codigo(), jugadores: [], opciones: {expansion:true, duelo:false, aprendizaje:false, segundosTurno:60, minutosJugador:0},
     iniciada:false, E:null, pendiente:null, reloj:null, relojAusente:null, creada:Date.now() };
   salas.set(s.codigo, s);
   sentar(s, nombre, ws);
@@ -72,6 +72,8 @@ function vista(s, yo) {
     mano: E.jugadores[yo].mano, mazo: E.mazo.length, retiradas: E.retiradas.length,
     descarte: E.descarte.length ? E.descarte[E.descarte.length-1] : null,
     registro: E.registro.slice(-9), ganador: E.ganador,
+    restante: E.vence ? Math.max(0, E.vence - Date.now()) : null,
+    bancos: s.opciones.minutosJugador > 0 ? E.jugadores.map(x => x.banco) : null,
     jugadas: miTurno ? E.jugadores[yo].mano.map((_,i)=>R.jugadasLegales(E, yo, i)) : null,
     sugerencias: (miTurno && s.opciones.aprendizaje) ? R.sugerencias(E, yo) : null
   });
@@ -95,7 +97,8 @@ const error = (ws, msg) => { try { ws.send(JSON.stringify({t:"error", msg})); } 
 /* ── Arranque de partida ────────────────────────────────────── */
 function empezar(s) {
   const E = {
-    jugadores: s.jugadores.map(j => ({ nombre: j.nombre, mano: [], cuerpo: [] })),
+    jugadores: s.jugadores.map(j => ({ nombre: j.nombre, mano: [], cuerpo: [],
+      banco: s.opciones.minutosJugador * 60000 })),
     mazo: R.barajar(R.crearMazo(s.opciones.expansion)), descarte: [], retiradas: [],
     turno: crypto.randomInt(s.jugadores.length), extra: 0, sinDescartar: false,
     objetivo: (s.opciones.duelo && s.jugadores.length === 2) ? 5 : 4,
@@ -104,7 +107,7 @@ function empezar(s) {
   E.jugadores.forEach((_,i) => R.robar(E, i));
   s.E = E; s.iniciada = true; s.pendiente = null;
   E.registro.push("Arranca " + E.jugadores[E.turno].nombre);
-  vigilarAusente(s);
+  programarTurno(s);
 }
 
 /* ── Ciclo de turno ─────────────────────────────────────────── */
@@ -120,24 +123,53 @@ function cerrarTurno(s) {
   }
   R.avanzarTurno(E);
   g = R.ganador(E);
-  if (g !== null) cantar(E, g);
-  vigilarAusente(s);
+  if (g !== null) { cantar(E, g); return; }
+  programarTurno(s);
 }
-function vigilarAusente(s) {
+/* Reloj del turno. Cubre tres casos con un solo temporizador:
+   el límite por turno, el banco de tiempo del jugador y la ausencia
+   de quien perdió la señal. Se pausa mientras hay una carta esperando
+   respuesta, para que nadie pierda tiempo por culpa de otro. */
+function consumir(s) {
+  const E = s.E;
+  if (!E || !E.turnoDesde) return;
+  const usado = Date.now() - E.turnoDesde;
+  E.turnoDesde = Date.now();
+  const j = E.jugadores[E.turno];
+  if (s.opciones.minutosJugador > 0) j.banco = Math.max(0, j.banco - usado);
+}
+function limiteTurno(s) {
+  const E = s.E, j = E.jugadores[E.turno];
+  let lim = Infinity;
+  if (s.opciones.segundosTurno > 0) lim = s.opciones.segundosTurno * 1000;
+  if (s.opciones.minutosJugador > 0) lim = Math.min(lim, Math.max(1500, j.banco));
+  if (!s.jugadores[E.turno].conectado) lim = Math.min(lim, SEGUNDOS_AUSENTE * 1000);
+  return lim;
+}
+function programarTurno(s) {
   clearTimeout(s.relojAusente);
   const E = s.E;
   if (!E || E.ganador !== null) return;
-  const j = s.jugadores[E.turno];
-  if (j.conectado) return;
-  s.relojAusente = setTimeout(() => {
-    if (!s.E || s.E.ganador !== null || s.jugadores[s.E.turno].conectado) return;
-    const ji = s.E.turno;
-    const sug = R.sugerencias(s.E, ji)[0];
-    if (sug) resolverJugada(s, ji, sug.idx, sug.jugada);
-    else { s.E.descarte.push(...s.E.jugadores[ji].mano.splice(0,1));
-      s.E.registro.push(s.E.jugadores[ji].nombre + " está ausente: descarta");
-      cerrarTurno(s); difundir(s); }
-  }, SEGUNDOS_AUSENTE * 1000);
+  E.turnoDesde = Date.now();
+  const lim = limiteTurno(s);
+  E.vence = lim === Infinity ? null : Date.now() + lim;
+  if (lim === Infinity) return;
+  s.relojAusente = setTimeout(() => jugarSolo(s), lim + 120);
+}
+function pausarTurno(s) { consumir(s); clearTimeout(s.relojAusente); s.E.vence = null; s.E.turnoDesde = null; }
+/* Se acabó el tiempo: el servidor juega por quien no respondió, para que la mesa siga. */
+function jugarSolo(s) {
+  const E = s.E;
+  if (!E || E.ganador !== null || s.pendiente) return;
+  const ji = E.turno;
+  consumir(s);
+  const ausente = !s.jugadores[ji].conectado;
+  E.registro.push(E.jugadores[ji].nombre + (ausente ? " está ausente" : " se quedó sin tiempo"));
+  const sug = R.sugerencias(E, ji)[0];
+  if (sug) return resolverJugada(s, ji, sug.idx, sug.jugada);
+  if (E.jugadores[ji].mano.length && !E.sinDescartar && !E.extra)
+    E.descarte.push(...E.jugadores[ji].mano.splice(0,1));
+  cerrarTurno(s); difundir(s);
 }
 
 /* ── Jugar una carta, con la ventana del traje de protección ── */
@@ -147,6 +179,7 @@ function resolverJugada(s, ji, idx, jugada) {
   const blancos = R.atacados(E, ji, jugada)
     .filter(k => E.jugadores[k].mano.some(c => c.tr === "traje"));
   if (blancos.length) {
+    pausarTurno(s);
     s.pendiente = { tipo:"traje", ji, idx, jugada, carta,
       esperando: blancos, usados: [], vence: Date.now() + SEGUNDOS_TRAJE*1000 };
     clearTimeout(s.reloj);
@@ -158,10 +191,11 @@ function resolverJugada(s, ji, idx, jugada) {
 }
 function ejecutar(s, ji, idx, jugada, protegidos) {
   const E = s.E;
+  consumir(s);
   const r = R.aplicar(E, ji, idx, jugada, protegidos);
   E.registro.push(...r.registro);
   if (r.fin) cerrarTurno(s);
-  else { const g = R.ganador(E); if (g !== null) cantar(E, g); }
+  else { const g = R.ganador(E); if (g !== null) cantar(E, g); else programarTurno(s); }
   difundir(s);
 }
 function cerrarPendiente(s) {
@@ -236,14 +270,17 @@ wss.on("connection", ws => {
       ws.sala = sa.codigo; ws.jugador = q.id;
       enviar(q, {t:"sesion", codigo:sa.codigo, token:q.token, yo:q.id});
       if (sa.E) sa.E.registro.push(q.nombre + " volvió a la mesa");
-      vigilarAusente(sa); difundir(sa); return;
+      programarTurno(sa); difundir(sa); return;
     }
     if (!s || !j) return;
 
     if (m.t === "opciones" && ws.jugador === 0 && !s.iniciada) {
+      const seg = [0,30,45,60,90,120], min = [0,5,10,15,20];
       Object.assign(s.opciones, {
         expansion: !!m.opciones.expansion, duelo: !!m.opciones.duelo,
-        aprendizaje: !!m.opciones.aprendizaje });
+        aprendizaje: !!m.opciones.aprendizaje,
+        segundosTurno: seg.includes(+m.opciones.segundosTurno) ? +m.opciones.segundosTurno : 60,
+        minutosJugador: min.includes(+m.opciones.minutosJugador) ? +m.opciones.minutosJugador : 0 });
       return difundir(s);
     }
     if (m.t === "empezar" && ws.jugador === 0 && !s.iniciada) {
@@ -287,7 +324,7 @@ wss.on("connection", ws => {
       if (hay && !s.E.sinDescartar) return error(ws, "Todavía tienes jugadas posibles");
       if (hay && s.E.sinDescartar) return error(ws, "Debes jugar una de las cartas que recibiste");
       s.E.registro.push(j.nombre + " no tenía jugada posible y pasó");
-      cerrarTurno(s); return difundir(s);
+      consumir(s); cerrarTurno(s); return difundir(s);
     }
     if (m.t === "descartar") {
       if (s.E.sinDescartar) return error(ws, "Con la segunda opinión no puedes descartar");
@@ -296,7 +333,7 @@ wss.on("connection", ws => {
       if (!idxs.length) return error(ws, "Elige al menos una carta");
       idxs.sort((a,b)=>b-a).forEach(i => s.E.descarte.push(s.E.jugadores[ws.jugador].mano.splice(i,1)[0]));
       s.E.registro.push(j.nombre + " descartó " + idxs.length + (idxs.length>1?" cartas":" carta"));
-      cerrarTurno(s); return difundir(s);
+      consumir(s); cerrarTurno(s); return difundir(s);
     }
   });
 
@@ -310,7 +347,7 @@ wss.on("connection", ws => {
       s.jugadores.forEach((x,i) => { x.id = i; if (x.ws) x.ws.jugador = i; });
     }
     if (!vivos(s) && !s.iniciada) salas.delete(s.codigo);
-    else { vigilarAusente(s); difundir(s); }
+    else { programarTurno(s); difundir(s); }
   });
 });
 
