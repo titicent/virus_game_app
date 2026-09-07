@@ -1,0 +1,10 @@
+# Plano de despliegue para Render: con este archivo en el repo,
+# "New → Blueprint" lo configura todo sin tocar ningún formulario.
+services:
+  - type: web
+    name: virus-en-linea
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
